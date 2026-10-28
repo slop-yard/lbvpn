@@ -10,9 +10,10 @@ search:
     - html
     - json
 
-# One address; the LB picks the exit.
+# Engine requests go straight to the LB pool (not through mitmproxy, so the
+# client's own TLS fingerprint is preserved).
 outgoing:
   request_timeout: 10.0
   proxies:
     all://:
-      - http://lb:8888
+      - http://lb:@@LB_PORT@@

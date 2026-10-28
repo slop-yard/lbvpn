@@ -1,0 +1,19 @@
+  mitm:
+    image: mitmproxy/mitmproxy:latest
+    entrypoint:
+      - mitmweb
+      - --mode
+      - upstream:http://lb:@@LB_PORT@@@8080
+      - --set
+      - upstream_cert=false
+      - --set
+      - "web_password=${MITM_WEB_PASSWORD:-@@MITM_PASSWORD@@}"
+      - --web-host
+      - 0.0.0.0
+      - --web-port
+      - "8081"
+    ports:
+      - "@@BIND@@:8181:8080"
+      - "@@BIND@@:8081:8081"
+    depends_on: [lb]
+    restart: unless-stopped

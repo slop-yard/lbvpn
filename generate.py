@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Generate a self-contained Docker Compose bundle from the command line.
+"""lbvpn - generate a Docker Compose bundle: N WireGuard exits (custom provider)
+behind an nginx load balancer, plus optional consumer modules.
 
-    N x gluetun (one Proton exit per region)  ->  nginx-stream LB  ->  optionally SearXNG
+    python generate.py --scan ./my-proton-confs --with-mitmproxy --with-debug ./vpn
 
-Usage:
-    python generate.py --regions fr,ch --lb-mode rr OUTPUT_DIR
-    python generate.py --regions fr,ch -f .env --include-stub OUTPUT_DIR
-
-No env file is required. `-f` is optional: when given, its values are checked
-and copied in as `.env` (and, with --inline, baked straight into the compose).
-Either way the output folder gets a `.env.example` listing every variable the
-stack expects.
+Exits come from WireGuard `.conf` files found by --scan. One file = one exit.
+The id is taken from an `XX#NN` token found in the file (e.g. `JP#275`), else
+from the file name; each file is copied into the bundle as
+`configs/wireguard/<id>.conf` and mounted as `/gluetun/wireguard/wg0.conf`.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import secrets
 import shutil
@@ -27,62 +25,39 @@ STUB = HERE / "stub"
 
 TOKEN = re.compile(r"@@[A-Z_]+@@")
 
-# ISO-3166 alpha-2 -> name used by the server filters (plus a couple of
-# common aliases). Convenience only; <REGION>_COUNTRY always wins.
-COUNTRY_NAMES = {
-    "ad": "Andorra", "ae": "United Arab Emirates", "al": "Albania",
-    "ar": "Argentina", "at": "Austria", "au": "Australia", "ba": "Bosnia and Herzegovina",
-    "be": "Belgium", "bg": "Bulgaria", "br": "Brazil", "ca": "Canada",
-    "ch": "Switzerland", "cl": "Chile", "co": "Colombia", "cr": "Costa Rica",
-    "cy": "Cyprus", "cz": "Czechia", "de": "Germany", "dk": "Denmark",
-    "ee": "Estonia", "eg": "Egypt", "en": "United Kingdom", "es": "Spain",
-    "fi": "Finland", "fr": "France", "gb": "United Kingdom", "ge": "Georgia",
-    "gr": "Greece", "hk": "Hong Kong", "hr": "Croatia", "hu": "Hungary",
-    "id": "Indonesia", "ie": "Ireland", "il": "Israel", "in": "India",
-    "is": "Iceland", "it": "Italy", "jp": "Japan", "kr": "South Korea",
-    "kz": "Kazakhstan", "lt": "Lithuania", "lu": "Luxembourg", "lv": "Latvia",
-    "md": "Moldova", "mx": "Mexico", "my": "Malaysia", "ng": "Nigeria",
-    "nl": "Netherlands", "no": "Norway", "nz": "New Zealand", "pe": "Peru",
-    "ph": "Philippines", "pl": "Poland", "pt": "Portugal", "ro": "Romania",
-    "rs": "Serbia", "se": "Sweden", "sg": "Singapore", "si": "Slovenia",
-    "sk": "Slovakia", "th": "Thailand", "tr": "Turkey", "tw": "Taiwan",
-    "ua": "Ukraine", "uk": "United Kingdom", "us": "United States",
-    "vn": "Vietnam", "za": "South Africa",
+# --- modules -------------------------------------------------------------
+# name -> template file for the service block. `--with-<name>` is generated
+# from these keys, so adding a module is one template + one entry.
+MODULES = {
+    "searxng": {
+        "template": "searxng-service.yaml",
+        "ports": [8080],
+        "readme": "| searxng | http `:8080` |",
+    },
+    "mitmproxy": {
+        "template": "mitmproxy-service.yaml",
+        "ports": [8181, 8081],
+        "readme": "| mitmproxy | http `:8181`, web ui `:8081` (password in `.env`) |",
+    },
+    "debug": {
+        "template": "debug-service.yaml",
+        "ports": [9000],
+        "requires": ["mitmproxy"],
+        "readme": "| debug | http `:9000`, egress ip per exit |",
+    },
 }
+# tolerated spellings
+MODULE_ALIASES = {"searchxng": "searxng"}
+# modules that don't add a service but do add files
+SPECIAL_MODULES = {"stub": "test the LB without VPN keys (writes compose.stub.yaml)"}
 
-# <REGION>_<SUFFIX> -> gluetun env var. Anything else under the region prefix
-# found in an env file is passed through with the suffix used verbatim.
-MAPPED_SUFFIXES = {
-    "WG_KEY": "WIREGUARD_PRIVATE_KEY",
-    "WG_ADDRESS": "WIREGUARD_ADDRESSES",
-    "COUNTRY": "SERVER_COUNTRIES",
-    "CITY": "SERVER_CITIES",
-}
+# a Proton-style server name, e.g. JP#275, CH-JP#2, KM#25 - found in the conf
+SERVER_NAME_RE = re.compile(r"\b([A-Z]{2}(?:-[A-Z]{2})?)#(\d{1,4})\b")
 
 
 def fail(message: str) -> "None":
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(1)
-
-
-def read_env(path: Path) -> dict:
-    if not path.is_file():
-        fail(f"env file not found: {path}")
-    values: dict = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[key.strip()] = value
-    return values
 
 
 def render(text: str, **tokens) -> str:
@@ -95,6 +70,7 @@ def render(text: str, **tokens) -> str:
 
 
 def yq(value: str) -> str:
+    """Quote a scalar for YAML (used for the debug targets JSON)."""
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
@@ -106,148 +82,197 @@ def template(name: str) -> str:
 
 
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
     parser = argparse.ArgumentParser(
         prog="generate.py",
-        description="Generate a docker compose bundle (N exits + LB + optional SearXNG).",
+        description="lbvpn - N WireGuard exits behind an nginx load balancer (+ consumer modules).",
     )
-    parser.add_argument("--regions", metavar="fr,ch",
-                        help="comma separated region codes (required unless the env file sets REGIONS)")
-    parser.add_argument("-f", "--env-file", metavar="ENV_FILE",
-                        help="optional env file to read values from")
+    parser.add_argument("--scan", metavar="DIR", required=True,
+                        help="directory of WireGuard .conf files; one file = one exit")
     parser.add_argument("--lb-mode", default="rr", metavar="MODE",
-                        help="rr | <region> | <host:port> (default: rr)")
-    parser.add_argument("--no-searchxng", action="store_true",
-                        help="do not bundle SearXNG")
-    parser.add_argument("--include-stub", action="store_true",
-                        help="copy the stub proxy in so you can test without VPN keys")
-    parser.add_argument("--inline", action="store_true",
-                        help="bake values from the env file into compose.yaml instead of ${VAR} refs")
-    parser.add_argument("out", metavar="OUTPUT_DIR", help="folder to write into")
+                        help="pool listener policy: rr | <region> | <host:port> (default: rr)")
+    parser.add_argument("--lb-port", type=int, default=8890, metavar="PORT",
+                        help="pool listener port (default: 8890)")
+    parser.add_argument("--region-port-base", type=int, default=3131, metavar="PORT",
+                        help="first per-region listener port (default: 3131, +1 per region)")
+    parser.add_argument("--bind", default="127.0.0.1", metavar="ADDR",
+                        help="host address to publish on (default: 127.0.0.1, use 0.0.0.0 to expose)")
+    parser.add_argument("--list-mods", action="store_true", help="list modules and exit")
+    for name in sorted(MODULES):
+        parser.add_argument(f"--with-{name}", action="store_true", help=f"bundle the {name} module")
+    for alias in sorted(MODULE_ALIASES):
+        parser.add_argument(f"--with-{alias}", action="store_true", help=argparse.SUPPRESS)
+    for name, help_text in sorted(SPECIAL_MODULES.items()):
+        parser.add_argument(f"--with-{name}", action="store_true", help=help_text)
+    parser.add_argument("out", metavar="OUTPUT_DIR", nargs="?", help="folder to write into")
     args = parser.parse_args(argv)
 
-    env = read_env(Path(args.env_file)) if args.env_file else {}
-    if args.inline and not args.env_file:
-        fail("--inline needs an env file (-f)")
+    if args.list_mods:
+        for name in sorted(MODULES):
+            print(f"  --with-{name}")
+        for name in sorted(SPECIAL_MODULES):
+            print(f"  --with-{name}\t{SPECIAL_MODULES[name]}")
+        return 0
 
-    regions_field = args.regions or env.get("REGIONS", "")
-    regions = [r.strip().lower() for r in regions_field.split(",") if r.strip()]
-    if not regions:
-        fail("no regions: pass --regions fr,ch (or set REGIONS= in an env file)")
-    duplicates = sorted({r for r in regions if regions.count(r) > 1})
-    if duplicates:
-        fail(f"duplicate region(s): {', '.join(duplicates)}")
+    if not args.out:
+        fail("OUTPUT_DIR is required")
+    if args.bind not in ("127.0.0.1", "0.0.0.0") and not re.match(r"^\d+\.\d+\.\d+\.\d+$", args.bind):
+        fail(f"--bind looks wrong: {args.bind}")
 
-    if args.env_file:
-        missing = [f"{r.upper()}_{s}" for r in regions for s in ("WG_KEY", "WG_ADDRESS")
-                   if not env.get(f"{r.upper()}_{s}")]
-        if missing:
-            fail(f"{args.env_file}: missing required key(s): {', '.join(missing)}")
+    scan_dir = Path(args.scan)
+    if not scan_dir.is_dir():
+        fail(f"--scan: directory not found: {scan_dir}")
+    conf_paths = sorted(p for p in scan_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() == ".conf")
+    if not conf_paths:
+        fail(f"--scan: no .conf files in {scan_dir}")
+
+    # --- scan: one file = one exit ------------------------------------------
+    exits = []
+    seen_ids = {}
+    for path in conf_paths:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "[interface]" not in text.lower() or "privatekey" not in text.lower():
+            fail(f"{path.name}: not a WireGuard config (no [Interface]/PrivateKey)")
+        match = SERVER_NAME_RE.search(text)
+        if match:
+            label, label_source = f"{match.group(1)}#{match.group(2)}", "found in file"
+        else:
+            label, label_source = path.stem, "file name"
+        ident = re.sub(r"[^a-z0-9]+", "", label.lower())
+        if not ident:
+            fail(f"{path.name}: could not derive a region id")
+        if ident in seen_ids:
+            fail(f"{path.name} and {seen_ids[ident]} both map to region id '{ident}' - rename one")
+        seen_ids[ident] = path.name
+        exits.append({"id": ident, "label": label, "source": label_source,
+                      "src_path": path, "conf": f"{ident}.conf"})
 
     # --- region services ----------------------------------------------------
-    region_template = template("region-service.yaml")
-    fragments = []
-    section_blocks = []
-    readme_lines = []
-    for region in regions:
-        up = region.upper()
-        country = env.get(f"{up}_COUNTRY") or COUNTRY_NAMES.get(region)
-
-        if args.inline:
-            key, address = env[f"{up}_WG_KEY"], env[f"{up}_WG_ADDRESS"]
-            if not country:
-                fail(f"region '{region}' has no country name; set {up}_COUNTRY=<country>")
-            country_token = country
-        else:
-            key = f"${{{up}_WG_KEY}}"
-            address = f"${{{up}_WG_ADDRESS}}"
-            if country:
-                country_token = f"${{{up}_COUNTRY:-{country}}}"
-            else:
-                country_token = f"${{{up}_COUNTRY}}"
-                print(f"warning: unknown region code '{region}'; "
-                      f"set {up}_COUNTRY in .env", file=sys.stderr)
-
-        city_line = ""
-        if env.get(f"{up}_CITY"):
-            city = f"${{{up}_CITY}}" if not args.inline else env[f"{up}_CITY"]
-            city_line = f"\n      SERVER_CITIES: {yq(city)}"
-
-        extra_lines = ""
-        prefix = f"{up}_"
-        for name, value in env.items():
-            if name.startswith(prefix) and name[len(prefix):] not in MAPPED_SUFFIXES:
-                shown = value if args.inline else f"${{{up}_{name[len(prefix):]}}}"
-                extra_lines += f"\n      {name[len(prefix):]}: {yq(shown)}"
-
-        fragments.append(render(
-            region_template, REGION=region, WG_KEY=key, WG_ADDRESS=address,
-            COUNTRY=country_token, CITY=city_line, EXTRA=extra_lines,
+    region_blocks = []
+    region_lines = []
+    for index, exit_ in enumerate(exits):
+        region = exit_["id"]
+        port = args.region_port_base + index
+        region_blocks.append(render(
+            template("region-wireguard.yaml"), REGION=region, CONF=exit_["conf"],
         ).rstrip("\n"))
-
-        section_blocks.append(
-            f"# --- {region} : {country or 'set ' + up + '_COUNTRY'} ---\n"
-            f"{up}_WG_KEY=\n{up}_WG_ADDRESS=\n"
-            f"# {up}_COUNTRY={country or ''}\n# {up}_CITY=\n"
+        region_lines.append(
+            f"| `:{port}` | `vpn-{region}` | `{exit_['conf']}` | `{exit_['label']}` |"
         )
-        readme_lines.append(f"  {region:>3} -> vpn-{region:<10} {country or '(set ' + up + '_COUNTRY)'}")
 
-    # compose requires ^[a-z0-9][a-z0-9_-]*$
-    project = re.sub(r"[^a-z0-9_-]+", "-", Path(args.out).resolve().name.lower()).strip("-_") or "mitmvpn"
+    # --- per-region listeners ----------------------------------------------
+    region_endpoints = []
+    port_lines = [f'      - "{args.bind}:{args.lb_port}:{args.lb_port}"']
+    for index, exit_ in enumerate(exits):
+        port = args.region_port_base + index
+        region_endpoints.append(f"{port}=vpn-{exit_['id']}:8888")
+        port_lines.append(f'      - "{args.bind}:{port}:{port}"')
 
-    # --- SearXNG / LB -------------------------------------------------------
-    searxng_block = ""
-    searxng_env = ""
-    searxng_files = ""
-    searxng_check = ""
-    searxng_note = ""
-    if not args.no_searchxng:
-        port = env.get("SEARXNG_PORT", "8080")
-        searxng_block = "\n" + render(template("searxng-service.yaml"), SEARXNG_PORT=port)
-        searxng_env = "SEARXNG_PORT=8080\n# SEARXNG_SECRET=\n"
-        searxng_files = "  configs/searxng.yaml        SearXNG settings (points at the LB)\n"
-        searxng_check = f"\n  # SearXNG UI\n  http://<host>:{port}\n"
-        searxng_note = " and SearXNG"
-    stub_files = "  stub/                       stub proxy for testing without VPN keys\n" if args.include_stub else ""
+    # --- modules ------------------------------------------------------------
+    enabled = {n for n in MODULES if getattr(args, f"with_{n}")}
+    for alias, target in MODULE_ALIASES.items():
+        if getattr(args, f"with_{alias}"):
+            enabled.add(target)
+    special = {n for n in SPECIAL_MODULES if getattr(args, f"with_{n}")}
+    for name in sorted(enabled):
+        for dependency in MODULES[name].get("requires", []):
+            if dependency not in enabled:
+                fail(f"--with-{name} requires --with-{dependency}")
 
+    mitm_password = secrets.token_hex(8)
+    debug_targets = {"pool": "mitm:8080"}
+    for index, exit_ in enumerate(exits):
+        debug_targets[exit_["id"]] = f"lb:{args.region_port_base + index}"
+
+    # --- published-port collision check -------------------------------------
+    taken = {args.lb_port: "the lb pool"}
+    for index, exit_ in enumerate(exits):
+        taken[args.region_port_base + index] = f"exit {exit_['id']}"
+    for name in sorted(enabled):
+        for port in MODULES[name]["ports"]:
+            if port in taken:
+                fail(f"host port {port} is used by both {taken[port]} and the {name} module; "
+                     f"change --lb-port/--region-port-base or disable one")
+            taken[port] = f"the {name} module"
+
+    module_blocks = []
+    for name in sorted(enabled):
+        block = template(MODULES[name]["template"])
+        if name == "searxng":
+            block = render(block, BIND=args.bind)
+        elif name == "mitmproxy":
+            block = render(block, LB_PORT=args.lb_port, BIND=args.bind,
+                           MITM_PASSWORD=mitm_password)
+        elif name == "debug":
+            block = render(block, BIND=args.bind, TARGETS=yq(json.dumps(debug_targets)))
+        module_blocks.append(block.rstrip("\n"))
+
+    # --- assemble -----------------------------------------------------------
+    project = re.sub(r"[^a-z0-9_-]+", "-", Path(args.out).resolve().name.lower()).strip("-_") or "lbvpn"
+    invocation = "generate.py " + " ".join(argv)
     compose = render(
         template("compose.yaml"),
         PROJECT=project,
-        REGION_SERVICES="\n\n".join(fragments),
+        INVOCATION=invocation,
+        REGION_SERVICES="\n\n".join(region_blocks),
         LB_MODE=args.lb_mode,
-        VPN_HOSTS=" ".join(f"vpn-{r}:8888" for r in regions),
-        LB_PORT=env.get("LB_PORT", "8890"),
-        LB_DEPENDS="".join(f"\n      - vpn-{r}" for r in regions),
-        SEARXNG=searxng_block,
+        POOL_PORT=args.lb_port,
+        VPN_HOSTS=" ".join(f"vpn-{e['id']}:8888" for e in exits),
+        REGION_ENDPOINTS=" ".join(f"{args.region_port_base + i}=vpn-{e['id']}:8888"
+                                  for i, e in enumerate(exits)),
+        LB_PORTS="\n".join(port_lines),
+        LB_DEPENDS="".join(f"\n      - vpn-{e['id']}" for e in exits),
+        MODULES=("\n" + "\n\n".join(module_blocks)) if module_blocks else "",
     )
+
+    module_env = ""
+    if "mitmproxy" in enabled:
+        module_env = ("\n# mitmproxy web ui password (http://localhost:8081)\n"
+                      f"MITM_WEB_PASSWORD={mitm_password}\n")
 
     env_example = render(
         template("env.example"),
-        REGIONS=",".join(regions),
-        REGION_SECTIONS="\n".join(section_blocks),
         LB_MODE=args.lb_mode,
-        LB_PORT=env.get("LB_PORT", "8890"),
-        SEARXNG_ENV=searxng_env,
+        MODULE_ENV=module_env,
     )
 
+    mod_readme = []
+    if "searxng" in enabled:
+        mod_readme.append("| `configs/searxng.yaml` | SearXNG settings (proxies -> the LB pool) |")
+    for name in sorted(enabled - {"searxng"}):
+        mod_readme.append(MODULES[name]["readme"])
+    if "stub" in special:
+        mod_readme.append("| `compose.stub.yaml` | run the LB without VPN keys |")
+
     readme = render(
-        template("README.txt"),
+        template("README.md"),
         PROJECT=project,
-        UNDERLINE="=" * len(project),
-        REGION_COUNT=len(regions),
-        REGIONS=", ".join(regions),
-        SEARXNG_NOTE=searxng_note,
-        SEARXNG_FILES=searxng_files,
-        STUB_FILES=stub_files,
-        LB_PORT=env.get("LB_PORT", "8890"),
-        SEARXNG_CHECK=searxng_check,
-        FIRST_REGION=regions[0],
-        REGION_LINES="\n".join(readme_lines),
+        REGION_COUNT=len(exits),
+        REGION_LINES="\n".join(region_lines),
+        LB_PORT=args.lb_port,
+        FIRST_REGION_PORT=args.region_port_base,
+        FIRST_REGION=exits[0]["id"],
+        MODULE_FILES="\n".join(mod_readme),
+    )
+
+    # --- stub override -------------------------------------------------------
+    stub_override = render(
+        template("compose.stub.yaml"),
+        REGION_OVERRIDES="\n".join(
+            f"  vpn-{e['id']}:\n    image: lbvpn-stub\n    build: ./stub\n"
+            f"    environment:\n      STUB_NAME: {e['id'].upper()}"
+            for e in exits
+        ),
     )
 
     # --- write --------------------------------------------------------------
     out = Path(args.out)
     configs = out / "configs"
+    wg_dir = configs / "wireguard"
     configs.mkdir(parents=True, exist_ok=True)
+    wg_dir.mkdir(parents=True, exist_ok=True)
     written = []
 
     def write(path: Path, text: str) -> None:
@@ -256,29 +281,28 @@ def main(argv=None) -> int:
 
     write(out / "compose.yaml", compose)
     write(out / ".env.example", env_example)
-    write(out / "README.txt", readme)
+    write(out / "README.md", readme)
     write(configs / "lb-entrypoint.sh", template("lb-entrypoint.sh"))
-    if not args.no_searchxng:
-        secret = env.get("SEARXNG_SECRET") or secrets.token_hex(16)
-        write(configs / "searxng.yaml", render(template("searxng.yaml"), SECRET=secret))
-
-    if args.env_file:
-        shutil.copyfile(args.env_file, out / ".env")
-        written.append(out / ".env")
-
-    if args.include_stub:
+    if "searxng" in enabled:
+        write(configs / "searxng.yaml",
+              render(template("searxng.yaml"), SECRET=secrets.token_hex(16), LB_PORT=args.lb_port))
+    if "debug" in enabled:
+        write(configs / "debug.py", template("debug.py"))
+    for exit_ in exits:
+        dst = wg_dir / exit_["conf"]
+        shutil.copyfile(exit_["src_path"], dst)
+        written.append(dst)
+    if "stub" in special:
         if not (STUB / "proxy.py").is_file():
             fail(f"stub sources not found at {STUB}")
         shutil.copytree(STUB, out / "stub", dirs_exist_ok=True)
-        written.extend(sorted((out / "stub").iterdir()))
+        write(out / "compose.stub.yaml", stub_override)
+        written.extend(sorted(p for p in (out / "stub").iterdir() if p.is_file()))
 
-    print(f"\n{len(regions)} region(s) -> {out.resolve()}")
+    print(f"lbvpn: {len(exits)} exit(s) -> {out.resolve()}")
     for path in written:
         print(f"  {path.relative_to(out)}")
-    if args.env_file:
-        print(f"\nnext:\n  cd {out} && docker compose up -d")
-    else:
-        print(f"\nnext:\n  cd {out} && cp .env.example .env && docker compose up -d")
+    print(f"\nnext:\n  cd {out} && docker compose up -d")
     return 0
 
 

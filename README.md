@@ -1,116 +1,144 @@
-# mitmvpn
+# lbvpn
 
-Generate a self-contained Docker Compose bundle from a few flags:
-**N Proton exits behind one nginx load balancer**, optionally with SearXNG.
+Scan a folder of WireGuard configs and generate a self-contained Docker
+Compose bundle: **one exit per `.conf` file, behind one nginx load balancer**,
+plus optional consumer modules.
 
 ```
-  clients
-  searxng · curl · scrapers
-        │
-        ▼
-  ┌─────────────┐
-  │  lb :8890   │   nginx stream
-  └──────┬──────┘
-    ┌────┼────┐
-    ▼    ▼    ▼
- vpn-fr vpn-en vpn-ch      gluetun, one WireGuard exit each
-    │    │    │
-    ▼    ▼    ▼
-   FR   EN   CH             Proton
+  consumers            LB                      exits (.conf files)
+  ┌──────────┐
+  │ searxng  │──────┐                    ┌────► vpn-jp275   ◄─ jp275.conf
+  ├──────────┤      │   ┌────────────┐   ├─────► vpn-fr480   ◄─ fr480.conf
+  │ mitmproxy│──────┼──►│  lb :8890  │───┤
+  ├──────────┤      │   │  :3131+    │   └─────► ...
+  │ debug    │──────┘   └────────────┘
+  └──────────┘          :8890 pool · :3131+ one exit each
 ```
 
 ## Usage
 
 ```sh
-python generate.py --regions fr,en,ch --lb-mode rr ./example
+python generate.py --scan ./my-proton-confs --with-mitmproxy --with-debug ./vpn
 ```
 
-| flag | meaning |
+| flag | |
 |---|---|
-| `--regions fr,en,ch` | region codes, one VPN container each (required unless `-f` sets `REGIONS=`) |
-| `-f, --env-file` | optional; values are checked and copied in as `.env` |
-| `--lb-mode` | `rr` (default) \| `<region>` \| `<host:port>` |
-| `--no-searchxng` | don't bundle SearXNG |
-| `--include-stub` | copy `stub/` in so you can test without VPN keys |
-| `--inline` | bake values from `-f` into `compose.yaml` instead of `${VAR}` refs |
+| `--scan ./dir` | **required**; every `*.conf` in there becomes one exit |
+| `--lb-mode` | pool policy: `rr` (default) \| `<region id>` \| `<host:port>` |
+| `--lb-port` | pool listener (default `8890`) |
+| `--region-port-base` | first per-exit listener (default `3131`, +1 each) |
+| `--bind` | host address to publish on (default `127.0.0.1`) |
+| `--with-<module>` | bundle a module (see below) |
+| `--list-mods` | list modules |
 
-No env file is required either way. The output always ships a `.env.example`
-listing every variable the stack expects, plus a `README.txt`.
+There is no env file input. The credentials live in the `.conf` files, so the
+generated `.env.example` only tunes the pool and the modules.
+
+## Labelling an exit
+
+For each `.conf`, lbvpn tries to find a Proton-style server name in the file -
+anywhere, including a comment you add yourself:
+
+```
+# JP#275
+[Interface]
+PrivateKey = ...
+```
+
+Found → the exit id is `jp275`. Not found → the file name is used
+(`my-tokyo-vps.conf` → `mytokyovps`). The id drives the
+service name (`vpn-<id>`), the config copy (`configs/wireguard/<id>.conf`) and
+the per-exit port, so keep them unique.
+
+Two files resolving to the same id is an error, not a silent merge.
 
 ## Output
 
 ```
-example/
-  compose.yaml                the stack
-  .env.example                per-region keys, pre-filled and empty
-  README.txt                  how to run it
-  configs/lb-entrypoint.sh    LB init script
-  configs/searxng.yaml        SearXNG settings (proxies -> http://lb:8888)
-  .env                        only when -f was given
-  stub/                       only with --include-stub
+vpn/
+  compose.yaml
+  .env.example              copy to .env (only tuning - no credentials in it)
+  README.md
+  configs/lb-entrypoint.sh
+  configs/wireguard/<id>.conf   your confs, copied and normalized
+  configs/searxng.yaml      (with searxng)
+  configs/debug.py          (with debug)
+  compose.stub.yaml         (with stub)
+  stub/                     (with stub)
 ```
 
 ## Run it
 
 ```sh
-cd example
-cp .env.example .env      # fill <REGION>_WG_KEY + <REGION>_WG_ADDRESS
+cd vpn
 docker compose up -d
 
-curl -x http://127.0.0.1:8890 https://ipinfo.io/ip
+curl -x http://127.0.0.1:8890 https://ipinfo.io/ip   # the pool
+curl -x http://127.0.0.1:3131 https://ipinfo.io/ip   # exactly one exit
 ```
 
-`.env.example` is generated from `--regions`, so the names always match:
+Per-exit ports are `--region-port-base + index` in the order the files were
+scanned (alphabetical). The pool balances per **TCP connection**, not per
+request; per-exit ports are exact regardless.
 
-```ini
-REGIONS=fr,en,ch
+`LB_MODE` in `.env` changes the pool policy (`rr` | `<id>` | `host:port`) —
+then `docker compose up -d lb`.
 
-# --- fr : France ---
-FR_WG_KEY=
-FR_WG_ADDRESS=
-# FR_COUNTRY=France
-# FR_CITY=
-...
+## Modules
 
-LB_MODE=rr
-LB_PORT=8890
-SEARXNG_PORT=8080
-```
+| module | requires | what it adds |
+|---|---|---|
+| `--with-searxng` | – | SearXNG, engine requests go to the LB pool (`:8080`) |
+| `--with-mitmproxy` | – | mitmweb, upstream = LB pool (`:8181` proxy, `:8081` web UI) |
+| `--with-debug` | mitmproxy | tiny server reporting the egress IP per exit (`:9000`) |
+| `--with-stub` | – | `compose.stub.yaml`, test the LB with no VPN keys |
 
-`<REGION>_COUNTRY` overrides the built-in code -> country-name map (the map
-only exists so the compose can default to `${FR_COUNTRY:-France}`).
-`<REGION>_CITY` narrows to a city. Any other `<REGION>_<X>` is passed through
-as env var `<X>` on that service.
+Modules are consumers of the LB, never in each other's path. Registering a new
+one is a template plus a `MODULES` entry in `generate.py`.
 
-## Load balancer
+## Gotchas
 
-`configs/lb-entrypoint.sh` writes the nginx config at container start:
-
-- `LB_MODE=rr` — round-robin over every region
-- `LB_MODE=fr` — pin to `vpn-fr:8888`
-- `LB_MODE=host:port` — pin to an explicit upstream
-
-Set it in `.env`, then `docker compose up -d lb`.
-
-The LB balances **per TCP connection**, not per request, so a keep-alive
-client holds one exit. (For SearXNG alone, listing several proxies in
-`outgoing.proxies` rotates per request and needs no LB at all.)
+- **Each `.conf` is one Proton key = one of your account's concurrent
+  connections** (Plus ~10, free 1).
+- **A `.conf` with several `[Peer]` blocks**: only the first is used.
+- **A missing `configs/wireguard/<id>.conf`** makes Docker create a *directory*
+  at that path and gluetun fails confusingly. Regenerate after adding files.
+- **The LB needs `zone vpns 64k;`** — without shared memory nginx's round-robin
+  counter is per worker and short-lived connections all hit the first server.
+- **The pool balances per TCP connection**, so a keep-alive client holds one
+  exit. (For SearXNG alone, listing several proxies in `outgoing.proxies`
+  rotates per request and needs no LB at all.)
+- **`xx#nn` exits use `VPN_SERVICE_PROVIDER: custom`** and mount the conf as
+  `/gluetun/wireguard/wg0.conf`. The key, address and endpoint all come from
+  the file, so `.env` carries no credentials - but you lose NAT-PMP port
+  forwarding and gluetun's server list for those regions, and the config dies
+  if Proton retires the server.
+- **Check egress over HTTPS, never plain HTTP.** `api.ipify.org` honours a
+  client-supplied `X-Forwarded-For`, which the proxy chain sets to the
+  immediate client's private address - so a plain-HTTP lookup reports the
+  *proxy*, not the exit. `icanhazip.com` and `ifconfig.me` are unaffected, and
+  nothing can inject headers into a tunneled request, so HTTPS is always
+  correct. This is why `--with-debug` uses HTTPS with verification off.
+- **mitmproxy replaces the TLS fingerprint.** It terminates and re-originates
+  TLS, so the target sees mitmproxy's fingerprint, not the client's - which
+  defeats impersonation (`curl_cffi`, browser TLS). Keep clients that rely on
+  that pointed at the LB directly.
+- **mitmproxy's `socks5` mode ignores the upstream proxy.** Combining
+  `--mode upstream:...` with `--mode socks5` makes the SOCKS listener go
+  *direct*, bypassing the VPN. Don't add a SOCKS listener to a VPN chain
+  without checking where it egresses.
+- **mitmweb requires a password** when bound to a non-loopback address; the
+  generated one is in `.env.example` as `MITM_WEB_PASSWORD`.
+- **Proton exit IPs get CAPTCHA'd** by Google/Bing; expect some engines to fail.
 
 ## Project layout
 
 ```
 generate.py     generator (stdlib only)
-templates/      compose.yaml, region-service.yaml, searxng-service.yaml,
-                searxng.yaml, env.example, README.txt, lb-entrypoint.sh
-stub/           stub HTTP proxy, copied with --include-stub
+templates/      compose.yaml, region-wireguard.yaml, lb-entrypoint.sh,
+                searxng-*.yaml, mitmproxy-service.yaml, debug*.yaml,
+                env.example, README.md, compose.stub.yaml
+stub/           stub HTTP proxy, copied with --with-stub
 ```
 
 `templates/` is the single source of truth; nothing is generated by hand.
-
-## Notes
-
-- Each region is one Proton connection. Plus allows ~10 concurrent; the free
-  tier allows 1, so an LB needs a paid plan.
-- Give every region its own WireGuard key **and** its own tunnel address
-  (`10.2.0.2/32`, `10.3.0.2/32`, ...).
-- Proton's exit IPs get CAPTCHA'd by Google/Bing; expect some engines to fail.

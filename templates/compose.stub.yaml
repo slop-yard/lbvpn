@@ -1,0 +1,6 @@
+# lbvpn test override - swaps the VPN containers for the stub proxy so the
+# load balancer can be exercised without Proton keys.
+#
+#   docker compose -f compose.yaml -f compose.stub.yaml up -d
+services:
+@@REGION_OVERRIDES@@

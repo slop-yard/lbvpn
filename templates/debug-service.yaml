@@ -1,0 +1,12 @@
+  debug:
+    image: python:3.12-alpine
+    command: ["python", "-u", "/configs/debug.py"]
+    environment:
+      DEBUG_TARGETS: @@TARGETS@@
+      DEBUG_PORT: "9000"
+    volumes:
+      - ./configs/debug.py:/configs/debug.py:ro
+    ports:
+      - "@@BIND@@:9000:9000"
+    depends_on: [lb, mitm]
+    restart: unless-stopped
