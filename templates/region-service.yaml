@@ -1,0 +1,13 @@
+  vpn-@@REGION@@:
+    image: qmcgaw/gluetun:latest
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    environment:
+      VPN_SERVICE_PROVIDER: protonvpn
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: "@@WG_KEY@@"
+      WIREGUARD_ADDRESSES: "@@WG_ADDRESS@@"
+      SERVER_COUNTRIES: "@@COUNTRY@@"@@CITY@@@@EXTRA@@
+      HTTPPROXY: "on"
+      HTTPPROXY_LISTENING_ADDRESS: ":8888"
+    restart: unless-stopped

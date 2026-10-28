@@ -1,0 +1,18 @@
+use_default_settings: true
+
+server:
+  secret_key: "@@SECRET@@"
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+
+# One address; the LB picks the exit.
+outgoing:
+  request_timeout: 10.0
+  proxies:
+    all://:
+      - http://lb:8888

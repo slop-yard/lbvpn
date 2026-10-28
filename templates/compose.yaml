@@ -1,0 +1,18 @@
+name: @@PROJECT@@
+
+services:
+@@REGION_SERVICES@@
+
+  lb:
+    image: nginx:alpine
+    entrypoint: ["/bin/sh", "/configs/lb-entrypoint.sh"]
+    environment:
+      LB_MODE: "${LB_MODE:-@@LB_MODE@@}"
+      VPN_HOSTS: "@@VPN_HOSTS@@"
+    ports:
+      - "127.0.0.1:${LB_PORT:-@@LB_PORT@@}:8888"
+    volumes:
+      - ./configs/lb-entrypoint.sh:/configs/lb-entrypoint.sh:ro
+    depends_on:@@LB_DEPENDS@@
+    restart: unless-stopped
+@@SEARXNG@@

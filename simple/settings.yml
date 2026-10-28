@@ -1,0 +1,19 @@
+use_default_settings: true
+
+server:
+  secret_key: "dev-only-change-me"
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+
+# This is the part that routes SearXNG's engine requests through gluetun.
+# httpx proxy format. "all://" covers http and https.
+outgoing:
+  request_timeout: 6.0
+  proxies:
+    all://:
+      - http://gluetun:8888
