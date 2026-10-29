@@ -223,7 +223,9 @@ def main(argv=None) -> int:
         REGION_ENDPOINTS=" ".join(f"{args.region_port_base + i}=vpn-{e['id']}:8888"
                                   for i, e in enumerate(exits)),
         LB_PORTS="\n".join(port_lines),
-        LB_DEPENDS="".join(f"\n      - vpn-{e['id']}" for e in exits),
+        LB_DEPENDS="".join(
+            f"\n      vpn-{e['id']}:\n        condition: service_healthy" for e in exits
+        ),
         MODULES=("\n" + "\n\n".join(module_blocks)) if module_blocks else "",
     )
 
