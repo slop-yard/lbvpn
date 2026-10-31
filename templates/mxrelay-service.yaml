@@ -1,0 +1,13 @@
+  mxrelay:
+    image: python:3.12-alpine
+    command: ["python", "-u", "/configs/mxrelay.py"]
+    environment:
+      MXRELAY_PORT: "9001"
+      MXRELAY_PROXY: "http://mitm:8080"
+      MXRELAY_AUTH_TOKEN: "${MXRELAY_AUTH_TOKEN:-@@MXRELAY_TOKEN@@}"
+    volumes:
+      - ./configs/mxrelay.py:/configs/mxrelay.py:ro
+    ports:
+      - "@@BIND@@:9001:9001"
+    depends_on: [mitm]
+    restart: unless-stopped

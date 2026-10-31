@@ -91,6 +91,7 @@ then `docker compose up -d lb`.
 | `--with-searxng` | – | SearXNG, engine requests go to the LB pool (`:8080`) |
 | `--with-mitmproxy` | – | mitmweb, upstream = LB pool (`:8181` proxy, `:8081` web UI) |
 | `--with-debug` | mitmproxy | tiny server reporting the egress IP per exit (`:9000`) |
+| `--with-mxrelay` | mitmproxy | fetch-as-a-service: `?url=<target>` relays method/headers/body through the chain (`:9001`, `X-MX-RELAY-AUTH` header auth) |
 | `--with-stub` | – | `compose.stub.yaml`, test the LB with no VPN keys |
 
 Modules are consumers of the LB, never in each other's path. Registering a new
@@ -127,6 +128,9 @@ one is a template plus a `MODULES` entry in `generate.py`.
   `--mode upstream:...` with `--mode socks5` makes the SOCKS listener go
   *direct*, bypassing the VPN. Don't add a SOCKS listener to a VPN chain
   without checking where it egresses.
+- **`--with-mxrelay` is an open fetch relay for anyone holding the token** -
+  it fetches arbitrary URLs through the chain (SSRF surface included), so keep
+  it bound to `127.0.0.1`/the tailnet and rotate the token if it ever leaks.
 - **mitmweb requires a password** when bound to a non-loopback address; the
   generated one is in `.env.example` as `MITM_WEB_PASSWORD`.
 - **Proton exit IPs get CAPTCHA'd** by Google/Bing; expect some engines to fail.

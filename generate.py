@@ -45,6 +45,12 @@ MODULES = {
         "requires": ["mitmproxy"],
         "readme": "| debug | http `:9000`, egress ip per exit |",
     },
+    "mxrelay": {
+        "template": "mxrelay-service.yaml",
+        "ports": [9001],
+        "requires": ["mitmproxy"],
+        "readme": "| mxrelay | fetch-as-a-service `:9001` (`?url=<target>`, egress via mitmproxy, header auth) |",
+    },
 }
 # tolerated spellings
 MODULE_ALIASES = {"searchxng": "searxng"}
@@ -182,6 +188,7 @@ def main(argv=None) -> int:
                 fail(f"--with-{name} requires --with-{dependency}")
 
     mitm_password = secrets.token_hex(8)
+    mxrelay_token = secrets.token_urlsafe(24)
     debug_targets = {"pool": "mitm:8080"}
     for index, exit_ in enumerate(exits):
         debug_targets[exit_["id"]] = f"lb:{args.region_port_base + index}"
@@ -207,6 +214,8 @@ def main(argv=None) -> int:
                            MITM_PASSWORD=mitm_password)
         elif name == "debug":
             block = render(block, BIND=args.bind, TARGETS=yq(json.dumps(debug_targets)))
+        elif name == "mxrelay":
+            block = render(block, BIND=args.bind, MXRELAY_TOKEN=mxrelay_token)
         module_blocks.append(block.rstrip("\n"))
 
     # --- assemble -----------------------------------------------------------
@@ -229,10 +238,16 @@ def main(argv=None) -> int:
         MODULES=("\n" + "\n\n".join(module_blocks)) if module_blocks else "",
     )
 
-    module_env = ""
+    module_env_parts = []
     if "mitmproxy" in enabled:
-        module_env = ("\n# mitmproxy web ui password (http://localhost:8081)\n"
-                      f"MITM_WEB_PASSWORD={mitm_password}\n")
+        module_env_parts.append(
+            "# mitmproxy web ui password (http://localhost:8081)\n"
+            f"MITM_WEB_PASSWORD={mitm_password}\n")
+    if "mxrelay" in enabled:
+        module_env_parts.append(
+            "# mxrelay fetch auth - send as:  -H \"X-MX-RELAY-AUTH: <token>\"\n"
+            f"MXRELAY_AUTH_TOKEN={mxrelay_token}\n")
+    module_env = "\n".join(module_env_parts)
 
     env_example = render(
         template("env.example"),
@@ -263,7 +278,11 @@ def main(argv=None) -> int:
     stub_override = render(
         template("compose.stub.yaml"),
         REGION_OVERRIDES="\n".join(
-            f"  vpn-{e['id']}:\n    image: lbvpn-stub\n    build: ./stub\n"
+            f"  vpn-{e['id']}:\n"
+            f"    image: lbvpn-stub\n    build: ./stub\n"
+            f"    healthcheck:\n"
+            f"      test: [\"CMD-SHELL\", \"wget -qO- http://127.0.0.1:8888 >/dev/null || exit 1\"]\n"
+            f"      interval: 5s\n      timeout: 5s\n      retries: 3\n"
             f"    environment:\n      STUB_NAME: {e['id'].upper()}"
             for e in exits
         ),
@@ -290,6 +309,8 @@ def main(argv=None) -> int:
               render(template("searxng.yaml"), SECRET=secrets.token_hex(16), LB_PORT=args.lb_port))
     if "debug" in enabled:
         write(configs / "debug.py", template("debug.py"))
+    if "mxrelay" in enabled:
+        write(configs / "mxrelay.py", template("mxrelay.py"))
     for exit_ in exits:
         dst = wg_dir / exit_["conf"]
         shutil.copyfile(exit_["src_path"], dst)
